@@ -17,6 +17,19 @@ def normalize_precoder(p):
     norm = tf.cast(norm, p.dtype)
     return p / norm
 
+def apply_channel_estimation_error(h1, h2, nmse, seed=None):
+    """Add estimation error: h_est = h + e, e ~ CN(0, nmse/2) per element."""
+    if seed is not None:
+        tf.random.set_seed(seed)
+    sigma = tf.sqrt(nmse / 2.0)
+    e1_re = tf.random.normal(tf.shape(h1), 0.0, sigma, dtype=tf.float32)
+    e1_im = tf.random.normal(tf.shape(h1), 0.0, sigma, dtype=tf.float32)
+    e2_re = tf.random.normal(tf.shape(h2), 0.0, sigma, dtype=tf.float32)
+    e2_im = tf.random.normal(tf.shape(h2), 0.0, sigma, dtype=tf.float32)
+    h1_est = h1 + tf.complex(e1_re, e1_im)
+    h2_est = h2 + tf.complex(e2_re, e2_im)
+    return h1_est, h2_est
+
 def sionna_h_batch(batch_size, M, scenario="umi",
                    carrier_frequency=3.5e9,
                    fft_size=128, subcarrier_spacing=30e3,
@@ -72,15 +85,39 @@ def sionna_h_batch(batch_size, M, scenario="umi",
     h2 = tf.cast(h_nb[:, 1, :], tf.complex64)
     return h1, h2
 
-# ---- Core RSMA sim ----
+# ---- SDMA: private streams only, 50-50 power ----
+# Precoders from h1_est, h2_est; gains use true h1, h2
 @tf.function(jit_compile=True)
-def rsma_rates_mc_from_h(h1, h2, snr_db=10.0, Pc_frac=0.2, P1_frac=0.4, P2_frac=0.4):
+def sdma_sum_rate(h1, h2, h1_est, h2_est, snr_db=10.0):
+    snr_lin = tf.cast(db2lin(snr_db), tf.float32)
+    noise_var = 1.0 / snr_lin
+    p1 = normalize_precoder(h1_est)
+    p2 = normalize_precoder(h2_est)
+    P1 = tf.constant(0.5, tf.float32)
+    P2 = tf.constant(0.5, tf.float32)
+
+    def gain(h, p):
+        hp = tf.reduce_sum(tf.math.conj(h) * p, axis=-1)
+        return tf.abs(hp)**2
+
+    g11 = gain(h1, p1); g12 = gain(h1, p2)
+    g21 = gain(h2, p1); g22 = gain(h2, p2)
+    sinr1 = (P1*g11) / (P2*g12 + noise_var)
+    sinr2 = (P2*g22) / (P1*g21 + noise_var)
+    R1 = tf.math.log(1.0 + sinr1) / tf.math.log(2.0)
+    R2 = tf.math.log(1.0 + sinr2) / tf.math.log(2.0)
+    return R1 + R2
+
+# ---- Core RSMA sim ----
+# Precoders from h1_est, h2_est; gains use true h1, h2
+@tf.function(jit_compile=True)
+def rsma_sum_rate(h1, h2, h1_est, h2_est, snr_db=10.0, Pc_frac=0.2, P1_frac=0.4, P2_frac=0.4):
     snr_lin = tf.cast(db2lin(snr_db), tf.float32)
     noise_var = 1.0 / snr_lin
 
-    pc = normalize_precoder(h1 + h2)
-    p1 = normalize_precoder(h1)
-    p2 = normalize_precoder(h2)
+    pc = normalize_precoder(h1_est + h2_est)
+    p1 = normalize_precoder(h1_est)
+    p2 = normalize_precoder(h2_est)
 
     Pc = tf.cast(Pc_frac, tf.float32)
     P1 = tf.cast(P1_frac, tf.float32)
@@ -104,43 +141,42 @@ def rsma_rates_mc_from_h(h1, h2, snr_db=10.0, Pc_frac=0.2, P1_frac=0.4, P2_frac=
     sinr_p2 = (P2*g22) / (P1*g21 + noise_var)
     Rp1 = tf.math.log(1.0 + sinr_p1) / tf.math.log(2.0)
     Rp2 = tf.math.log(1.0 + sinr_p2) / tf.math.log(2.0)
-
-    return Rc, Rp1, Rp2, sinr_c1, sinr_c2, sinr_p1, sinr_p2
+    sum_rate = Rc + Rp1 + Rp2
+    return sum_rate
 def main():
-    batch = 20000
+    batch = 10000
     M = 4
-    snr_db = 10.0
+    snr_dbs = np.linspace(0, 20, 11)
+    nmse = 0.1  # normalized MSE of channel estimate (10%)
 
     h1, h2 = sionna_h_batch(batch, M, scenario="umi", pick="dc", seed=1)
-    print("h1 shape:", h1.shape, "dtype:", h1.dtype)
-    print("h2 shape:", h2.shape, "dtype:", h2.dtype)
+    h1_est, h2_est = apply_channel_estimation_error(h1, h2, nmse, seed=42)
 
-    Rc, Rp1, Rp2, sc1, sc2, sp1, sp2 = rsma_rates_mc_from_h(
-        h1, h2, snr_db=snr_db, Pc_frac=0.2, P1_frac=0.4, P2_frac=0.4
-    )
+    sdma_ideal = []
+    sdma_ce = []
+    rsma_ideal = []
+    rsma_ce = []
 
-    Rc_np = Rc.numpy()
-    Rp1_np = Rp1.numpy()
-    Rp2_np = Rp2.numpy()
+    for snr_db in snr_dbs:
+        sdma_ideal.append(sdma_sum_rate(h1, h2, h1, h2, snr_db=float(snr_db)).numpy().mean())
+        sdma_ce.append(sdma_sum_rate(h1, h2, h1_est, h2_est, snr_db=float(snr_db)).numpy().mean())
+        rsma_ideal.append(rsma_sum_rate(h1, h2, h1, h2, snr_db=float(snr_db), Pc_frac=0.2, P1_frac=0.4, P2_frac=0.4).numpy().mean())
+        rsma_ce.append(rsma_sum_rate(h1, h2, h1_est, h2_est, snr_db=float(snr_db), Pc_frac=0.2, P1_frac=0.4, P2_frac=0.4).numpy().mean())
 
-    print("Mean Rc:", Rc_np.mean())
-    print("Mean Rp1:", Rp1_np.mean())
-    print("Mean Rp2:", Rp2_np.mean())
-    print("Mean sum-rate:", (Rc_np + Rp1_np + Rp2_np).mean())
-
-    # quick histogram
-    plt.figure()
-    plt.hist(Rc_np, bins=80, alpha=0.6, label="Rc")
-    plt.hist(Rp1_np, bins=80, alpha=0.6, label="Rp1")
-    plt.hist(Rp2_np, bins=80, alpha=0.6, label="Rp2")
+    plt.figure(figsize=(7, 5))
+    plt.plot(snr_dbs, sdma_ideal, "o-", label="SDMA (perfect CSI)")
+    plt.plot(snr_dbs, sdma_ce, "s-", label="SDMA (channel est. errors)")
+    plt.plot(snr_dbs, rsma_ideal, "^-", label="RSMA (perfect CSI)")
+    plt.plot(snr_dbs, rsma_ce, "d-", label="RSMA (channel est. errors)")
+    plt.xlabel("SNR (dB)")
+    plt.ylabel("Sum rate (bits/s/Hz)")
     plt.legend()
-    plt.title(f"Rate samples @ SNR={snr_db} dB")
+    plt.title(f"SDMA vs RSMA: effect of channel estimation (NMSE = {nmse})")
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig("rsma_quick_check.png", dpi=200)
+    plt.savefig("rsma_sdma_channel_estimation.png", dpi=200)
     plt.close()
-    
-
-    print("Wrote rsma_quick_check.png")
+    print("Wrote rsma_sdma_channel_estimation.png")
 
 if __name__ == "__main__":
     main()
